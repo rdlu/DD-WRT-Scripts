@@ -1,0 +1,294 @@
+﻿#!/bin/bash
+######################################################################
+# D-shaper - DSL/Cable modem outbound traffic shaper and
+# 		prioritizer, Based on the ADSL/Cable
+# 		wondershaper (www.lartc.org)
+#		optimized for newer kernels by Ðarius.
+#		- www.darius.it -
+#	USAGE:
+#		shape {upstream interface} {maximum rate}
+#		shape status
+#	I.E.:
+#		# for a 256Kbps upstream connection (put a smaller
+#		# value if it doesn't work perfectly
+#		#
+#	shape eth2 220
+#		#
+#		# fine tune the upstream value for your needs
+#
+######################################################################
+
+UPSTREAM=$1	# upstream interface
+TRUSTED=via	# trusted home network
+UNTRUSTED=none	# another untrusted network interface (i.e.: eth3)
+		# you could have around
+		# (i.e.: a subnet You wanna grant limited
+		# bandwidth to)
+		if [ ! -e /sys/class/net/$UNTRUSTED ]; then
+			UNTRUSTED=""
+		fi
+
+RATEUP=$2	# Upstream maximum bitrate
+RATE_UNTRUSTED=200 # Maximum DOWNLOAD bitrate for your secondary
+		# network, if any
+MTUUP=576	# A commonly suggested optimal value for the
+		# internet.
+		# Change it on your needs.
+
+if [ "$1" = "status" ]
+then
+	for i in $(ls /sys/class/net); do
+		echo "-----------------------------"
+		echo "[qdisc] $i"
+		tc -s qdisc show dev $i
+		echo "[class] $i"
+		tc -s class show dev $i
+		echo "[filter] $i"
+		tc -s filter show dev $i
+	done
+        exit
+fi
+
+# Reset everything to a known state (cleared)
+for i in $(ls /sys/class/net); do
+	tc qdisc del dev $i root 2>/dev/null
+done
+
+# clear entries from iptables
+for i in $(ls /sys/class/net); do
+	iptables -t mangle -D POSTROUTING -o $i \
+		-j MYSHAPER-OUT 2> /dev/null > /dev/null
+done
+
+iptables -t mangle -F MYSHAPER-OUT 2> /dev/null > /dev/null
+iptables -t mangle -X MYSHAPER-OUT 2> /dev/null > /dev/null
+
+if [ "$1" = "stop" ]
+then
+        echo "Shaping removed."
+        exit
+fi
+
+if [ -z $1 ]; then
+	echo 'Specify output device'
+	exit
+fi
+
+if [ -z $2 ]
+then
+	echo 'Specify output rate (Kbit/s)'
+	exit
+fi
+
+###########################################################
+#
+# UNTRUSTED network limits
+if [ ! -e /sys/class/net/$UNTRUSTED ]; then
+	tc qdisc add dev $UNTRUSTED root handle 1: tbf rate \
+		$RATE_UNTRUSTED burst 10k latency 1s
+fi
+
+###########################################################
+# Outbound Shaping (limits total bandwidth to RATEUP)
+###########################################################
+
+# set queue size to give latency of about 2 seconds on
+# low-prio packets
+ip link set dev $UPSTREAM qlen 30
+
+# changes mtu on the outbound device.  Lowering the mtu
+# will result in lower latency but will also cause slightly
+# lower throughput due to IP and TCP protocol overhead.
+# 576 is a quite widespread value
+ip link set dev $UPSTREAM mtu $MTUUP
+
+# add HTB root qdisc
+tc qdisc add dev $UPSTREAM root handle 1: htb default 26
+
+# add main rate limit classes
+tc class add dev $UPSTREAM parent 1: classid 1:1 htb \
+	rate ${RATEUP}kbit
+
+# setting main classes: Each class can lend and borrow bandwidth
+# from each-other
+# P2P has the lowest guaranteed bandwidth and lowest priority.
+# P2P: 1/20 of the total bandwidth.
+# Real time class (voip) has 1/3 of the remaining 19/20th
+# and all other classes share what still
+# equals ((bandwidth * 19/20)/5)
+# Change the following values according to your needs.
+
+# Real Time
+tc class add dev $UPSTREAM parent 1:1 classid 1:20 htb \
+	rate $[($RATEUP*19/20)/3]kbit \
+	ceil ${RATEUP}kbit quantum 1 prio 0
+
+# Interactive
+tc class add dev $UPSTREAM parent 1:1 classid 1:21 htb  \
+	rate $[($RATEUP*19/20)/15]kbit \
+	ceil ${RATEUP}kbit quantum 1 prio 1
+
+# Games
+tc class add dev $UPSTREAM parent 1:1 classid 1:22 htb  \
+	rate $[($RATEUP*19/20)/15]kbit \
+	ceil ${RATEUP}kbit quantum 1 prio 2
+
+# Low ports
+tc class add dev $UPSTREAM parent 1:1 classid 1:23 htb  \
+	rate $[($RATEUP*19/20)/15]kbit \
+	ceil ${RATEUP}kbit quantum 1 prio 3
+
+# User apps
+tc class add dev $UPSTREAM parent 1:1 classid 1:24 htb \
+	rate $[($RATEUP*19/20)/15]kbit \
+	ceil ${RATEUP}kbit quantum 1 prio 4
+
+# Bulk transfers
+tc class add dev $UPSTREAM parent 1:1 classid 1:25 htb \
+	rate $[($RATEUP*19/20)/15]kbit \
+	ceil ${RATEUP}kbit quantum 1 prio 5
+
+# P2P
+tc class add dev $UPSTREAM parent 1:1 classid 1:26 htb \
+	rate $[$RATEUP/20]kbit \
+	ceil ${RATEUP}kbit quantum 1 prio 6
+
+# attach qdisc to leaf classes - here we at SFQ to each
+# priority class.  SFQ makes sure that
+#within each class connections will be treated (almost) fairly.
+
+# no sfq 'cause we should have almost no queue here.
+# Better dropping packets than delay them in VoIP
+tc qdisc add dev $UPSTREAM parent 1:20 handle 20: pfifo limit 5
+
+tc qdisc add dev $UPSTREAM parent 1:21 handle 21: pfifo limit 30
+tc qdisc add dev $UPSTREAM parent 1:22 handle 22: pfifo limit 30
+
+# long queue here and sqf not to drop too much packets,
+# if possible
+tc qdisc add dev $UPSTREAM parent 1:23 handle 23: sfq perturb 10 \
+	limit 200
+tc qdisc add dev $UPSTREAM parent 1:24 handle 24: sfq perturb 10 \
+	limit 200
+tc qdisc add dev $UPSTREAM parent 1:25 handle 25: sfq perturb 10 \
+	limit 200
+
+# longest queue for really bulk transfers
+tc qdisc add dev $UPSTREAM parent 1:26 handle 26: sfq perturb 10  \
+	limit 300
+
+# add MYSHAPER-OUT chain to the mangle table in iptables
+# - this sets up the table we'll use
+# to filter and mark packets.
+iptables -t mangle -N MYSHAPER-OUT
+iptables -t mangle -I POSTROUTING -o $UPSTREAM -j MYSHAPER-OUT
+
+# Actually classify packets using the CLASSIFY iptables target,
+# instead of others.
+# Should work on 2.6 kernels, should on patched 2.5 ones.
+# If not, check your iproute2/iptables installation and proper
+# netfilter kernel support.
+
+# 1:20 Real time
+# ensure min delay by TOS field
+iptables -t mangle -A MYSHAPER-OUT -m tos --tos 0x10 -j CLASSIFY \
+	--set-class 1:20
+
+# VoIP,RTP,RTSP, (23399, 35724 or others for Skype: set your
+# ports here)
+iptables -t mangle -A MYSHAPER-OUT -p udp -m multiport \
+	--ports 5060:5063,8000,554,23399,35724 \
+	-j CLASSIFY --set-class 1:20
+
+# RTSP
+iptables -t mangle -A MYSHAPER-OUT -p tcp --dport 554 \
+	-j CLASSIFY --set-class 1:20
+
+# NTP
+iptables -t mangle -A MYSHAPER-OUT -p udp --dport 123 \
+	-j CLASSIFY --set-class 1:20
+
+# 1:21 Small Interactive
+# ICMP
+iptables -t mangle -A MYSHAPER-OUT -p icmp \
+	-j CLASSIFY --set-class 1:21
+
+# SSH, not SCP
+iptables -t mangle -A MYSHAPER-OUT -p tcp -m multiport \
+	--ports ssh -m limit --limit 10/second \
+	 -j CLASSIFY --set-class 1:21
+
+# telnet
+iptables -t mangle -A MYSHAPER-OUT -p tcp --dport telnet \
+	-j CLASSIFY --set-class 1:21
+
+# telnet
+iptables -t mangle -A MYSHAPER-OUT -p tcp --sport telnet \
+	-j CLASSIFY --set-class 1:21
+
+# DNS
+iptables -t mangle -A MYSHAPER-OUT -p udp --dport domain \
+	-j CLASSIFY --set-class 1:21
+
+iptables -t mangle -A MYSHAPER-OUT -p tcp \
+	--tcp-flags SYN,RST,ACK SYN,FIN \
+	-j CLASSIFY --set-class 1:21
+
+# 1:22 Bulk Interactive
+# MSN/Webcam
+iptables -t mangle -A MYSHAPER-OUT -p tcp --dport 6891 \
+	-j CLASSIFY --set-class 1:22
+
+# Windows remote desktop
+iptables -t mangle -A MYSHAPER-OUT -p tcp --dport 3389 \
+	-j CLASSIFY --set-class 1:22
+
+# 1:22 Games
+
+# 1:23 Low port services
+# Default for low port traffic
+iptables -t mangle -A MYSHAPER-OUT -p tcp --sport 0:1024 \
+	-j CLASSIFY --set-class 1:23
+
+# ""
+iptables -t mangle -A MYSHAPER-OUT -p tcp --dport 0:1024 \
+	-j CLASSIFY --set-class 1:23
+
+# 1:24 User apps
+# ICQ (add tcp 4000 for old icq protocols, if needed), MSN
+iptables -t mangle -A MYSHAPER-OUT -p tcp -m multiport \
+	--dports 5190,1863 -j CLASSIFY --set-class 1:24
+
+# Local services for the Internet
+# Local web server
+#iptables -t mangle -A MYSHAPER-OUT -p tcp --sport http \
+#	-j CLASSIFY --set-class 1:25
+
+# Local smtp server
+#iptables -t mangle -A MYSHAPER-OUT -p tcp --sport smtp \
+#	-j CLASSIFY --set-class 1:25
+
+# small packets (probably just ACKs)
+iptables -t mangle -A MYSHAPER-OUT -p tcp -m length --length 60 \
+	-j CLASSIFY --set-class 1:22
+
+# 1:25 Bulk transfers
+# ftp-data port, low prio
+iptables -t mangle -A MYSHAPER-OUT -p tcp --dport ftp-data \
+	-j CLASSIFY --set-class 1:25
+
+# 1:26 P2P, etc. Everything that hasn't been classified since now,
+# is considered bulk
+# like P2P, and will have it's lowest priority
+# P2P
+#iptables -t mangle -A MYSHAPER-OUT -m ipp2p --ipp2p \
+#	-j CLASSIFY --set-class 1:26
+
+##################################################################
+# Done with outbound shaping
+##################################################################
+echo "Outbound shaping added to $UPSTREAM.  Rate: ${RATEUP}Kb/s."
+
+# For now I don't handle inbound shaping. Maybe in a
+# further version
+exit

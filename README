@@ -1,0 +1,10 @@
+Some DD-WRT Useful Scripts (WIP)
+
+For now only a HFSC and HTB QoS Script
+
+Based on works by
+
+HFSC: Maciej Bliziński, http://automatthias.wordpress.com/
+HTB: wondershaper (www.lartc.org)
+
+I'm mainly testing on D-Link DIR-600 b1.
